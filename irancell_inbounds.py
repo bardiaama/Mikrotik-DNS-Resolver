@@ -53,6 +53,9 @@ REALITY_SNI = os.getenv("XUI_REALITY_SNI", "www.datadoghq.com")
 PANEL_URL = os.getenv("XUI_PANEL_URL", "")
 PANEL_USERNAME = os.getenv("XUI_PANEL_USERNAME", "")
 PANEL_PASSWORD = os.getenv("XUI_PANEL_PASSWORD", "")
+# 3x-ui "Secret Token" (Panel Settings -> Security). When the panel has secret
+# auth enabled, the /login form needs this as `loginSecret`. Never commit it.
+PANEL_SECRET = os.getenv("XUI_PANEL_SECRET", "")
 # Some panels live under a secret base path, e.g. /abc123/. Leave empty if none.
 PANEL_BASE_PATH = os.getenv("XUI_PANEL_BASE_PATH", "")
 
@@ -396,20 +399,25 @@ def write_files(inbounds: list[Inbound]) -> None:
 
 def push_to_panel(inbounds: list[Inbound]) -> None:
     import requests
+    from urllib3.exceptions import InsecureRequestWarning
 
-    if not (PANEL_URL and PANEL_USERNAME and PANEL_PASSWORD):
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    if not PANEL_URL or not (PANEL_SECRET or (PANEL_USERNAME and PANEL_PASSWORD)):
         raise SystemExit(
-            "Set XUI_PANEL_URL, XUI_PANEL_USERNAME and XUI_PANEL_PASSWORD to push."
+            "Set XUI_PANEL_URL plus either XUI_PANEL_SECRET, or "
+            "XUI_PANEL_USERNAME + XUI_PANEL_PASSWORD, to push."
         )
 
     base = PANEL_URL.rstrip("/") + (("/" + PANEL_BASE_PATH.strip("/")) if PANEL_BASE_PATH else "")
     sess = requests.Session()
 
-    login = sess.post(
-        f"{base}/login",
-        data={"username": PANEL_USERNAME, "password": PANEL_PASSWORD},
-        timeout=15,
-    )
+    # 3x-ui accepts username/password and, when secret auth is on, a loginSecret.
+    # Send whatever we have; the panel ignores empty fields.
+    login_data = {"username": PANEL_USERNAME, "password": PANEL_PASSWORD}
+    if PANEL_SECRET:
+        login_data["loginSecret"] = PANEL_SECRET
+    login = sess.post(f"{base}/login", data=login_data, timeout=15, verify=False)
     login.raise_for_status()
     if not login.json().get("success"):
         raise SystemExit(f"Panel login failed: {login.text}")
@@ -420,6 +428,7 @@ def push_to_panel(inbounds: list[Inbound]) -> None:
             f"{base}/panel/api/inbounds/add",
             json=inb.to_panel_payload(),
             timeout=15,
+            verify=False,
         )
         ok = resp.ok and resp.json().get("success")
         print(f"  {'OK ' if ok else 'ERR'} {inb.remark}: {resp.json().get('msg', resp.text)[:120]}")
