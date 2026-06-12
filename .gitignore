@@ -1,0 +1,4 @@
+# Generated inbound configs contain private keys / passwords -- never commit.
+inbounds/
+__pycache__/
+*.pyc
