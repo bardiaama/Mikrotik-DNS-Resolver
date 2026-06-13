@@ -33,13 +33,25 @@ Pure Python 3 stdlib only.
 import base64
 import json
 import os
+import re
 import secrets
 import sys
 import urllib.request
 import uuid
 from urllib.parse import quote
 
-REALITY_SNI = os.getenv("IR_REALITY_SNI", "www.datadoghq.com")
+
+def _clean_sni(value: str) -> str:
+    """Tolerate pasted markdown links etc.  '[host](https://host)' -> 'host'."""
+    value = value.strip()
+    m = re.match(r"^\[([^\]]+)\]\((?:https?://)?[^)]*\)$", value)
+    if m:
+        value = m.group(1)
+    value = re.sub(r"^https?://", "", value).strip().strip("/")
+    return value
+
+
+REALITY_SNI = _clean_sni(os.getenv("IR_REALITY_SNI", "www.datadoghq.com"))
 
 
 # --------------------------------------------------------------------------- #
