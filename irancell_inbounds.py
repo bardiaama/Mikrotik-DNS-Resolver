@@ -34,8 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+# Pure-stdlib only: this script is meant to run anywhere, including straight on
+# the 3x-ui server (where `requests`/`cryptography` may not be installed) so it
+# can reach the panel over localhost. No third-party imports.
 
 # --------------------------------------------------------------------------- #
 # Configuration -- override via environment variables instead of editing here. #
@@ -70,18 +71,59 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
+_P25519 = 2 ** 255 - 19
+
+
+def _x25519(scalar: bytes, u_coord: bytes) -> bytes:
+    """RFC 7748 X25519 (Montgomery ladder), pure Python -- matches `xray x25519`."""
+    def _clamp(k: bytes) -> int:
+        b = bytearray(k)
+        b[0] &= 248
+        b[31] &= 127
+        b[31] |= 64
+        return int.from_bytes(b, "little")
+
+    u = bytearray(u_coord)
+    u[31] &= 127
+    x1 = int.from_bytes(u, "little")
+    k = _clamp(scalar)
+
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        a = (x2 + z2) % _P25519
+        aa = (a * a) % _P25519
+        b = (x2 - z2) % _P25519
+        bb = (b * b) % _P25519
+        e = (aa - bb) % _P25519
+        c = (x3 + z3) % _P25519
+        d = (x3 - z3) % _P25519
+        da = (d * a) % _P25519
+        cb = (c * b) % _P25519
+        x3 = pow((da + cb) % _P25519, 2, _P25519)
+        z3 = (x1 * pow((da - cb) % _P25519, 2, _P25519)) % _P25519
+        x2 = (aa * bb) % _P25519
+        z2 = (e * ((aa + (121665 * e) % _P25519) % _P25519)) % _P25519
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    res = (x2 * pow(z2, _P25519 - 2, _P25519)) % _P25519
+    return res.to_bytes(32, "little")
+
+
 def gen_reality_keypair() -> tuple[str, str]:
     """Return (private_key, public_key) in the base64url form `xray x25519` uses."""
-    priv = X25519PrivateKey.generate()
-    priv_raw = priv.private_bytes(
-        serialization.Encoding.Raw,
-        serialization.PrivateFormat.Raw,
-        serialization.NoEncryption(),
-    )
-    pub_raw = priv.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
-    return _b64url(priv_raw), _b64url(pub_raw)
+    priv = bytearray(secrets.token_bytes(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    pub = _x25519(bytes(priv), b"\x09" + b"\x00" * 31)
+    return _b64url(bytes(priv)), _b64url(pub)
 
 
 def gen_short_id(n_bytes: int = 8) -> str:
@@ -398,10 +440,11 @@ def write_files(inbounds: list[Inbound]) -> None:
 # --------------------------------------------------------------------------- #
 
 def push_to_panel(inbounds: list[Inbound]) -> None:
-    import requests
-    from urllib3.exceptions import InsecureRequestWarning
-
-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    import ssl
+    import urllib.error
+    import urllib.request
+    from http.cookiejar import CookieJar
+    from urllib.parse import urlencode
 
     if not PANEL_URL or not (PANEL_SECRET or (PANEL_USERNAME and PANEL_PASSWORD)):
         raise SystemExit(
@@ -410,28 +453,54 @@ def push_to_panel(inbounds: list[Inbound]) -> None:
         )
 
     base = PANEL_URL.rstrip("/") + (("/" + PANEL_BASE_PATH.strip("/")) if PANEL_BASE_PATH else "")
-    sess = requests.Session()
+
+    # Panels usually have self-signed certs; don't verify.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(CookieJar()),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+
+    def _post(path: str, *, form: dict | None = None, body_json: dict | None = None) -> dict:
+        if form is not None:
+            data = urlencode(form).encode()
+            ctype = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(body_json).encode()
+            ctype = "application/json"
+        req = urllib.request.Request(
+            base + path, data=data,
+            headers={"Content-Type": ctype, "Accept": "application/json"},
+        )
+        try:
+            with opener.open(req, timeout=20) as r:
+                raw = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"success": False, "msg": raw[:200]}
 
     # 3x-ui accepts username/password and, when secret auth is on, a loginSecret.
     # Send whatever we have; the panel ignores empty fields.
-    login_data = {"username": PANEL_USERNAME, "password": PANEL_PASSWORD}
+    login_form = {"username": PANEL_USERNAME, "password": PANEL_PASSWORD}
     if PANEL_SECRET:
-        login_data["loginSecret"] = PANEL_SECRET
-    login = sess.post(f"{base}/login", data=login_data, timeout=15, verify=False)
-    login.raise_for_status()
-    if not login.json().get("success"):
-        raise SystemExit(f"Panel login failed: {login.text}")
+        login_form["loginSecret"] = PANEL_SECRET
+    login = _post("/login", form=login_form)
+    if not login.get("success"):
+        raise SystemExit(f"Panel login failed: {login.get('msg', login)}")
     print("Logged into panel.")
 
+    added = 0
     for inb in inbounds:
-        resp = sess.post(
-            f"{base}/panel/api/inbounds/add",
-            json=inb.to_panel_payload(),
-            timeout=15,
-            verify=False,
-        )
-        ok = resp.ok and resp.json().get("success")
-        print(f"  {'OK ' if ok else 'ERR'} {inb.remark}: {resp.json().get('msg', resp.text)[:120]}")
+        resp = _post("/panel/api/inbounds/add", body_json=inb.to_panel_payload())
+        ok = bool(resp.get("success"))
+        added += ok
+        print(f"  {'OK ' if ok else 'ERR'} {inb.remark}: {str(resp.get('msg', ''))[:120]}")
+    print(f"\nDone: {added}/{len(inbounds)} inbounds added.")
 
 
 # --------------------------------------------------------------------------- #
