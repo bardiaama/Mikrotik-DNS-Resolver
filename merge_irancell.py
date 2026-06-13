@@ -35,6 +35,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import urllib.request
 import uuid
@@ -139,6 +140,22 @@ def extract_clients(inbounds: list) -> list:
     return []
 
 
+def os_listening_ports() -> set:
+    """Ports already bound on the host (nginx, sshd, ...), via `ss`."""
+    ports = set()
+    try:
+        out = subprocess.run(["ss", "-tuln"], capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return ports
+    for line in out.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2:
+            m = re.search(r":(\d+)$", fields[-2])
+            if m:
+                ports.add(int(m.group(1)))
+    return ports
+
+
 def port_picker(used: set):
     def pick(preferred: int) -> int:
         p = preferred
@@ -158,7 +175,7 @@ def build_inbounds(clients: list, pick) -> tuple[list, list]:
     # 1) VLESS + Reality + Vision (raw TCP)
     priv, pub = reality_keypair()
     sid = secrets.token_hex(8)
-    port = pick(443)
+    port = pick(9443)
     vision_clients = [dict(c, flow="xtls-rprx-vision") for c in clients]
     inbounds.append({
         "listen": "0.0.0.0", "port": port, "protocol": "vless",
@@ -263,6 +280,7 @@ def main() -> None:
 
     addr = os.getenv("IR_SERVER_ADDR") or detect_public_ip()
     used = {i.get("port") for i in inbounds if isinstance(i.get("port"), int)}
+    used |= os_listening_ports()  # avoid nginx/sshd/etc. already bound on the host
     pick = port_picker(used)
 
     new_inbounds, meta = build_inbounds(clients, pick)
